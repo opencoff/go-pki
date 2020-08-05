@@ -166,10 +166,12 @@ func openBoltDB(dbc *dbConfig, clk clock) (Storage, error) {
 		ekey := b.Get(pkey)
 		sbytes := b.Get(nkey)
 		ver := b.Get(vkey)
-		d.salt = make([]byte, 32)
-		if salt == nil || ekey == nil || sbytes == nil || ver == nil ||
-			len(salt) != 32 || len(ver) != 4 {
+		if len(ver) == 0 && (len(salt) > 0 || len(ekey) > 0 || len(sbytes) > 0) {
+			return fmt.Errorf("Old version of DB; please upgrade DB")
+		}
 
+		d.salt = make([]byte, 32)
+		if salt == nil || ekey == nil || sbytes == nil || ver == nil {
 			var vers [4]byte
 
 			d.pwd = make([]byte, 32)
@@ -212,10 +214,14 @@ func openBoltDB(dbc *dbConfig, clk clock) (Storage, error) {
 			return nil
 		}
 
+		if len(salt) != 32 || len(ver) != 4 {
+			return fmt.Errorf("DB corrupt; salt/version# malformed")
+		}
+
 		// check the version#
 		dbver := binary.LittleEndian.Uint32(ver)
 		if dbver != DBVersion {
-			return fmt.Errorf("%s: Incorrect DB version (exp %d, want %d)", fn, DBVersion, dbver)
+			return fmt.Errorf("%s: Incorrect DB version (exp %d, saw %d)", fn, DBVersion, dbver)
 		}
 
 		// This may be an initialized DB. Lets verify it.
