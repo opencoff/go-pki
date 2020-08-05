@@ -25,6 +25,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
+	"fmt"
 
 	"golang.org/x/crypto/argon2"
 	"golang.org/x/crypto/hkdf"
@@ -34,6 +35,8 @@ const (
 	_Time    uint32 = 1
 	_Mem     uint32 = 1 * 1024 * 1024
 	_Threads uint8  = 8
+
+	_NonceSize int = 16
 )
 
 // Argon2 KDF
@@ -43,12 +46,10 @@ func kdf(pwd []byte, salt []byte) []byte {
 }
 
 // Expand a strong KDF derived key into a 32 byte cipher key
-func expand(pwd, salt []byte) []byte {
-	var buf [32]byte // AES-256 key
-
+func expand(out []byte, pwd, salt []byte) []byte {
 	rd := hkdf.Expand(sha512.New, pwd, salt)
-	rd.Read(buf[:])
-	return buf[:]
+	rd.Read(out[:])
+	return out
 }
 
 // entangle an expanded password with a DB key
@@ -59,18 +60,19 @@ func (d *db) key(cn string) []byte {
 	return m.Sum(nil)
 }
 
-// encrypt a blob and return it
-func (d *db) encrypt(b []byte) ([]byte, error) {
-	var salt [32]byte
-	var nonceb [sha256.Size]byte
+func aeadEncrypt(data []byte, key, salt []byte, ad []byte) ([]byte, error) {
+	var nonceb [_NonceSize]byte
+	var kdfsaltb [sha256.Size]byte
+	var aesKey [32]byte
 
-	randbytes(salt[:])
+	nonce := randbytes(nonceb[:])
+
 	h := sha256.New()
-	h.Write(salt[:])
-	h.Write(d.salt)
-	nonce := h.Sum(nonceb[:0])
+	h.Write(nonce)
+	h.Write(salt)
+	kdfsalt := h.Sum(kdfsaltb[:0])
 
-	key := expand(d.pwd, salt[:])
+	key = expand(aesKey[:], key, kdfsalt)
 	aes, err := aes.NewCipher(key)
 	if err != nil {
 		return nil, err
@@ -81,56 +83,62 @@ func (d *db) encrypt(b []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	c := ae.Seal(nil, nonce, b, salt[:])
-	c = append(c, salt[:]...)
+	c := ae.Seal(nil, nonce, data, ad)
+	c = append(c, nonce...)
 
 	return c, nil
+}
+
+func aeadDecrypt(edata []byte, key, salt []byte, ad []byte) ([]byte, error) {
+	n := len(edata)
+	var kdfsaltb [sha256.Size]byte
+	var aesKey [32]byte
+
+	// Max GCM tag size is 16
+	// XXX This is not a constant exposed by crypto/aes
+	//     we have to instantiate an aead instance to get the tag size! Grr.
+	if n < (16 + _NonceSize) {
+		return nil, ErrTooSmall
+	}
+
+	nonce := edata[n-_NonceSize:]
+	edata = edata[:n-_NonceSize]
+
+	h := sha256.New()
+	h.Write(nonce)
+	h.Write(salt)
+	kdfsalt := h.Sum(kdfsaltb[:0])
+
+	key = expand(aesKey[:], key, kdfsalt)
+	aes, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+
+	ae, err := cipher.NewGCMWithNonceSize(aes, len(nonce))
+	if err != nil {
+		return nil, err
+	}
+
+	return ae.Open(nil, nonce, edata, ad)
+}
+
+// encrypt a blob and return it
+func (d *db) encrypt(b []byte) ([]byte, error) {
+	return aeadEncrypt(b, d.pwd, d.salt, d.salt)
 }
 
 // decrypt a buffer and return
 func (d *db) decrypt(b []byte) ([]byte, error) {
-	var nonceb [sha256.Size]byte
-
-	// 32: Salt size (suffix)
-	// 16: GCM tag size
-	if len(b) < (32 + 16) {
-		return nil, ErrTooSmall
-	}
-
-	n := len(b)
-	salt := b[n-32:]
-	b = b[:n-32]
-
-	h := sha256.New()
-	h.Write(salt[:])
-	h.Write(d.salt)
-	nonce := h.Sum(nonceb[:0])
-
-	key := expand(d.pwd, salt)
-	aes, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
-	}
-
-	ae, err := cipher.NewGCMWithNonceSize(aes, len(nonce))
-	if err != nil {
-		return nil, err
-	}
-
-	c, err := ae.Open(nil, nonce, b, salt)
-	if err != nil {
-		return nil, err
-	}
-
-	return c, nil
+	return aeadDecrypt(b, d.pwd, d.salt, d.salt)
 }
 
 // read random bytes and return it
-func randbytes(salt []byte) []byte {
-	n, err := rand.Read(salt)
-	if err != nil || n != 32 {
-		panic("can't read 32 rand bytes")
+func randbytes(b []byte) []byte {
+	n, err := rand.Read(b)
+	if err != nil || n != len(b) {
+		panic(fmt.Sprintf("rand read %d fail (%s)", len(b), err))
 	}
 
-	return salt
+	return b
 }

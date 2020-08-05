@@ -30,7 +30,7 @@ func TestCreate(t *testing.T) {
 	assert(ca == nil, "ca is not nil")
 
 	ca, err = newWithClock(cfg, clk, db, true)
-	assert(err == nil, "ca create failed")
+	assert(err == nil, "ca create failed: %s", err)
 	assert(ca != nil, "ca is nil")
 	assert(ca.Certificate != nil, "ca.cert is nil")
 }
@@ -38,17 +38,23 @@ func TestCreate(t *testing.T) {
 func TestBasic(t *testing.T) {
 	assert := newAsserter(t)
 
-	dir, dbfile := tmpFile()
-
+	td := newTmpDir()
+	dbfile := td.newFile()
 	defer func() {
-		os.RemoveAll(dir)
+		td.cleanup()
 	}()
+
+	dbc := &dbConfig{
+		Name:   dbfile,
+		Passwd: "pwd",
+		Create: true,
+	}
 
 	clk0 := newDummyClock()
 	clk1 := newDummyClock()
 	rdb := newRamStore(clk0)
-	bdb, err := openBoltDB(dbfile, clk1, "pwd", true)
-	assert(err == nil, "can't create boltdb instance")
+	bdb, err := openBoltDB(dbc, clk1)
+	assert(err == nil, "can't create boltdb instance: %s", err)
 	assert(bdb != nil, "boltdb is nil")
 
 	t.Run("ramDB", func(t *testing.T) {
@@ -64,16 +70,21 @@ func TestBasic(t *testing.T) {
 func TestICA0(t *testing.T) {
 	assert := newAsserter(t)
 
-	dir, dbfile := tmpFile()
-
+	td := newTmpDir()
+	dbfile := td.newFile()
 	defer func() {
-		os.RemoveAll(dir)
+		td.cleanup()
 	}()
 
+	dbc := &dbConfig{
+		Name:   dbfile,
+		Passwd: "pwd",
+		Create: true,
+	}
 	clk0 := newDummyClock()
 	clk1 := newDummyClock()
 	rdb := newRamStore(clk0)
-	bdb, err := openBoltDB(dbfile, clk1, "pwd", true)
+	bdb, err := openBoltDB(dbc, clk1)
 	assert(err == nil, "can't create boltdb instance")
 	assert(bdb != nil, "boltdb is nil")
 
@@ -90,18 +101,22 @@ func TestICA0(t *testing.T) {
 func TestICA1(t *testing.T) {
 	assert := newAsserter(t)
 
-	dir, dbfile := tmpFile()
-
+	td := newTmpDir()
+	dbfile := td.newFile()
 	defer func() {
-		os.RemoveAll(dir)
+		td.cleanup()
 	}()
 
+	dbc := &dbConfig{
+		Name:   dbfile,
+		Passwd: "pwd",
+		Create: true,
+	}
 	clk0 := newDummyClock()
 	clk1 := newDummyClock()
 	rdb := newRamStore(clk0)
-	bdb, err := openBoltDB(dbfile, clk1, "pwd", true)
+	bdb, err := openBoltDB(dbc, clk1)
 	assert(err == nil, "can't create boltdb instance")
-	assert(bdb != nil, "boltdb is nil")
 
 	t.Run("ramDB", func(t *testing.T) {
 		t.Parallel()
@@ -116,16 +131,21 @@ func TestICA1(t *testing.T) {
 func TestRevokeCA(t *testing.T) {
 	assert := newAsserter(t)
 
-	dir, dbfile := tmpFile()
-
+	td := newTmpDir()
+	dbfile := td.newFile()
 	defer func() {
-		os.RemoveAll(dir)
+		td.cleanup()
 	}()
 
+	dbc := &dbConfig{
+		Name:   dbfile,
+		Passwd: "pwd",
+		Create: true,
+	}
 	clk0 := newDummyClock()
 	clk1 := newDummyClock()
 	rdb := newRamStore(clk0)
-	bdb, err := openBoltDB(dbfile, clk1, "pwd", true)
+	bdb, err := openBoltDB(dbc, clk1)
 	assert(err == nil, "can't create boltdb instance")
 	assert(bdb != nil, "boltdb is nil")
 
@@ -151,7 +171,7 @@ func testRevokeCA(db Storage, clk *dummyClock, t *testing.T) {
 	}
 
 	ca, err := newWithClock(cfg, clk, db, true)
-	assert(err == nil, "ca create failed")
+	assert(err == nil, "ca create failed: %s", err)
 	assert(ca != nil, "ca is nil")
 	assert(ca.Certificate != nil, "ca.cert is nil")
 
@@ -222,7 +242,7 @@ func testBasic(db Storage, clk *dummyClock, t *testing.T) {
 
 	cn := "a.example.com"
 	ca, err := newWithClock(cfg, clk, db, true)
-	assert(err == nil, "ca create failed")
+	assert(err == nil, "ca create failed: %s", err)
 	assert(ca != nil, "ca is nil")
 	assert(ca.Certificate != nil, "ca.cert is nil")
 
@@ -242,8 +262,10 @@ func testBasic(db Storage, clk *dummyClock, t *testing.T) {
 	assert(err == nil, "can't find newly created cert: %s", err)
 	assert(cx != nil, "server cert is nil")
 
-	assert(byteEq(ck.SubjectKeyId, cx.SubjectKeyId), "skid key mismatch:\nwant %x\nhave %x\n", ck.SubjectKeyId, cx.SubjectKeyId)
-	assert(byteEq(ck.AuthorityKeyId, cx.AuthorityKeyId), "akid key mismatch:\nwant %x\nhave %x\n", ck.AuthorityKeyId, cx.AuthorityKeyId)
+	assert(byteEq(ck.SubjectKeyId, cx.SubjectKeyId),
+		"skid key mismatch:\nwant %x\nhave %x\n", ck.SubjectKeyId, cx.SubjectKeyId)
+	assert(byteEq(ck.AuthorityKeyId, cx.AuthorityKeyId),
+		"akid key mismatch:\nwant %x\nhave %x\n", ck.AuthorityKeyId, cx.AuthorityKeyId)
 
 	// advance time to verify expiry
 	clk.advanceDay(2)
@@ -268,8 +290,10 @@ func testBasic(db Storage, clk *dummyClock, t *testing.T) {
 	assert(err == nil, "can't find newly created client cert: %s", err)
 	assert(cx != nil, "client cert is nil")
 
-	assert(byteEq(ck.SubjectKeyId, cx.SubjectKeyId), "skid key mismatch:\nwant %x\nhave %x\n", ck.SubjectKeyId, cx.SubjectKeyId)
-	assert(byteEq(ck.AuthorityKeyId, cx.AuthorityKeyId), "akid key mismatch:\nwant %x\nhave %x\n", ck.AuthorityKeyId, cx.AuthorityKeyId)
+	assert(byteEq(ck.SubjectKeyId, cx.SubjectKeyId),
+		"skid key mismatch:\nwant %x\nhave %x\n", ck.SubjectKeyId, cx.SubjectKeyId)
+	assert(byteEq(ck.AuthorityKeyId, cx.AuthorityKeyId),
+		"akid key mismatch:\nwant %x\nhave %x\n", ck.AuthorityKeyId, cx.AuthorityKeyId)
 
 	clk.advanceDay(4)
 	assert(!ca.IsValid(), "ca should have expired")
@@ -288,7 +312,7 @@ func testCA0(db Storage, clk *dummyClock, t *testing.T) {
 
 	cacn := "client-ca"
 	ca, err := newWithClock(cfg, clk, db, true)
-	assert(err == nil, "ca create failed")
+	assert(err == nil, "ca create failed: %s", err)
 	assert(ca != nil, "ca is nil")
 	assert(ca.Certificate != nil, "ca.cert is nil")
 
@@ -319,7 +343,9 @@ func testCA0(db Storage, clk *dummyClock, t *testing.T) {
 	assert(err == nil, "can't list all CAs via ICA")
 	assert(len(cas) == 2, "#CA via ICA mismatch; exp 2, saw %d", len(cas))
 
-	for i := 0; i < 5; i++ {
+	const ncerts = 500
+
+	for i := 0; i < ncerts; i++ {
 		cn := fmt.Sprintf("user%d@example.com", i)
 		sn := fmt.Sprintf("server%d.example.com", i)
 		ci = &CertInfo{
@@ -329,32 +355,32 @@ func testCA0(db Storage, clk *dummyClock, t *testing.T) {
 			Validity: time.Duration(25 * time.Hour),
 		}
 
-		ck, err := ica.NewClientCert(ci, "")
+		ck, err := ica2.NewClientCert(ci, "")
 		assert(err == nil, "can't create client cert: %s", err)
 		assert(ck != nil, "new client cert nil")
 
-		ck, err = ica.FindClient(cn)
+		ck, err = ica2.FindClient(cn)
 		assert(err == nil, "can't find client cert: %s", err)
 		assert(ck != nil, "client cert nil")
 
-		clk.advanceSec(30)
+		clk.advanceSec(1)
 		ci.Subject.CommonName = sn
 		ci.DNSNames = []string{sn}
-		sk, err := ica.NewServerCert(ci, "")
+		sk, err := ica2.NewServerCert(ci, "")
 		assert(err == nil, "can't create server cert: %s", err)
 		assert(sk != nil, "new server cert nil")
 
-		sk, err = ica.FindServer(sn)
+		sk, err = ica2.FindServer(sn)
 		assert(err == nil, "can't find server cert: %s", err)
 		assert(sk != nil, "server cert nil")
 	}
 
 	ckc, err := ca.GetClients()
 	assert(err == nil, "can't get all clients: %s", err)
-	assert(len(ckc) == 5, "#client certs mismatch: exp 5, saw %d", len(ckc))
+	assert(len(ckc) == ncerts, "#client certs mismatch: exp %d, saw %d", ncerts, len(ckc))
 	cks, err := ca.GetServers()
 	assert(err == nil, "can't get all servers: %s", err)
-	assert(len(cks) == 5, "#server certs mismatch: exp 5, saw %d", len(cks))
+	assert(len(cks) == ncerts, "#server certs mismatch: exp %d, saw %d", ncerts, len(cks))
 }
 
 func testCA1(db Storage, clk *dummyClock, t *testing.T) {
@@ -369,7 +395,7 @@ func testCA1(db Storage, clk *dummyClock, t *testing.T) {
 	}
 
 	ca, err := newWithClock(cfg, clk, db, true)
-	assert(err == nil, "ca create failed")
+	assert(err == nil, "ca create failed: %s", err)
 	assert(ca != nil, "ca is nil")
 	assert(ca.Certificate != nil, "ca.cert is nil")
 
@@ -415,26 +441,33 @@ func testCA1(db Storage, clk *dummyClock, t *testing.T) {
 	assert(err == nil, "Can't find chain for client cert: %s", err)
 	assert(len(cas) == 4, "cert chain len != 4, saw %d", len(cas))
 
-	assert(byteEq(ck.AuthorityKeyId, cas[0].SubjectKeyId),     "issuer #0 mismatch")
-	assert(byteEq(ck.AuthorityKeyId, ica3.SubjectKeyId),       "issuer #0 mismatch")
+	assert(byteEq(ck.AuthorityKeyId, cas[0].SubjectKeyId), "issuer #0 mismatch")
+	assert(byteEq(ck.AuthorityKeyId, ica3.SubjectKeyId), "issuer #0 mismatch")
 
 	assert(byteEq(cas[0].AuthorityKeyId, cas[1].SubjectKeyId), "issuer #1 mismatch")
-	assert(byteEq(cas[0].AuthorityKeyId, ica2.SubjectKeyId),   "issuer #1 mismatch")
+	assert(byteEq(cas[0].AuthorityKeyId, ica2.SubjectKeyId), "issuer #1 mismatch")
 
 	assert(byteEq(cas[1].AuthorityKeyId, cas[2].SubjectKeyId), "issuer #2 mismatch")
-	assert(byteEq(cas[1].AuthorityKeyId, ica.SubjectKeyId),    "issuer #1 mismatch")
+	assert(byteEq(cas[1].AuthorityKeyId, ica.SubjectKeyId), "issuer #1 mismatch")
 
 	assert(byteEq(cas[2].AuthorityKeyId, cas[3].SubjectKeyId), "issuer #3 mismatch")
-	assert(byteEq(cas[2].AuthorityKeyId, ca.SubjectKeyId),	   "issuer root mismatch")
+	assert(byteEq(cas[2].AuthorityKeyId, ca.SubjectKeyId), "issuer root mismatch")
 }
 
+type tmpState struct {
+	dir string
+}
 
-func tmpFile() (string, string) {
+func newTmpDir() *tmpState {
 	dir, err := ioutil.TempDir("", "bdb")
 	if err != nil {
 		panic(err)
 	}
 
+	return &tmpState{dir: dir}
+}
+
+func (s *tmpState) newFile() string {
 	var b [6]byte
 
 	n, err := rand.Read(b[:])
@@ -442,5 +475,9 @@ func tmpFile() (string, string) {
 		panic("can't read rand")
 	}
 
-	return dir, fmt.Sprintf("%s/test_%x.db", dir, b[:])
+	return fmt.Sprintf("%s/test_%x.db", s.dir, b[:])
+}
+
+func (s *tmpState) cleanup() {
+	os.RemoveAll(s.dir)
 }

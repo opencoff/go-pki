@@ -1,9 +1,0 @@
-* More tests:
-   - db create, re-open
-   - crl generation
-   - all remaining apis
-
-* DB Migration:
-   - add a version#
-   - write a one-time pre 0.9 -> 0.9 migration
-   - generic migration framework from version n -> n+1

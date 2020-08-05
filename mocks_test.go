@@ -215,6 +215,11 @@ func (r *ram) MapRevoked(fp func(time.Time, *Cert)) error {
 	return nil
 }
 
+// XXX Fill this
+func (r *ram) ExportJSON() (string, error) {
+	return "", nil
+}
+
 func (r *ram) dump() {
 	root := r.root
 	fmt.Printf("root-CA: %x %x %s\n", root.SubjectKeyId, root.SerialNumber, root.NotAfter)

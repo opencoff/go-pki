@@ -57,12 +57,17 @@ type Storage interface {
 	// delete server cert
 	DeleteServerCert(cn string) error
 
+	// Export DB in portable JSON
+	ExportJSON() (string, error)
+
+	// XXX Do we need a MergeJSON() operation to merge data from
+	// a json blob?
+
 	// - Iterators -
 	MapICA(func(*Cert) error) error
 	MapClientCerts(func(*Cert) error) error
 	MapServerCerts(func(*Cert) error) error
 	MapRevoked(func(time.Time, *Cert)) error
-
 
 	FindRevoked(skid []byte) (time.Time, *Cert, error)
 }

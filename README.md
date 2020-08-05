@@ -9,6 +9,12 @@ It has _no_ dependencies on any other external tool such as openssl.
   certificates and keys.
 * All data strored in the database is encrypted with keys derived from a user
   supplied CA passphrase.
+* Support for issuing & revoking:
+   - Server Certs (optionally signed by intermediate CAs)
+   - Client Certs (optionally signed by intermediate CAs)
+   - Intermediate CA certs (optionally signed by other intermediate
+     CAs)
+* Flexible CRL generation
 * The certificates and keys are opinionated:
    * All CA cert private keys are Secp521r1
    * Client & Servers cert private keys are Secp256k1

@@ -22,7 +22,9 @@ import (
 	"encoding/asn1"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
+	"runtime"
 	"time"
 )
 
@@ -33,12 +35,12 @@ const _MinValidity time.Duration = 24 * time.Hour
 type CA struct {
 	*x509.Certificate
 
-	Expired  bool
+	Expired   bool
 	CARevoked bool
 
 	key *ecdsa.PrivateKey
 
-	parent  *CA
+	parent *CA
 
 	// persistent storage
 	db Storage
@@ -59,9 +61,9 @@ type Cert struct {
 	Key    *ecdsa.PrivateKey
 	Rawkey []byte
 
-	IsServer bool
-	IsCA     bool
-	Expired  bool
+	IsServer  bool
+	IsCA      bool
+	Expired   bool
 	CARevoked bool
 
 	// Additional info provided when cert was created
@@ -102,13 +104,36 @@ type Config struct {
 	Validity time.Duration
 }
 
+// New creates a new PKI CA instance with storage backed by boltdb in 'dbname'
 func New(cfg *Config, dbname string, create bool) (*CA, error) {
 	clk := newSysClock()
-	db, err := openBoltDB(dbname, clk, cfg.Passwd, create)
+	dbc := &dbConfig{
+		Name:   dbname,
+		Passwd: cfg.Passwd,
+		Create: create,
+	}
+	db, err := openBoltDB(dbc, clk)
 	if err != nil {
 		return nil, err
 	}
 	return newWithClock(cfg, clk, db, create)
+}
+
+// NewFromJSON creates a new PKI CA instance with storage backed by boltDB in 'dbname'
+// with initial contents coming from the JSON blob
+func NewFromJSON(cfg *Config, dbname, jsonStr string) (*CA, error) {
+	clk := newSysClock()
+	dbc := &dbConfig{
+		Name:   dbname,
+		Passwd: cfg.Passwd,
+		Json:   jsonStr,
+		Create: true,
+	}
+	db, err := openBoltDB(dbc, clk)
+	if err != nil {
+		return nil, err
+	}
+	return newWithClock(cfg, clk, db, true)
 }
 
 // NewWithStorage creates a new RootCA with the given storage engine
@@ -188,6 +213,66 @@ func (ca *CA) NewServerCert(ci *CertInfo, pw string) (*Cert, error) {
 	return ca.newCert(ci, pw, true)
 }
 
+// Sign the given CSR with the provided CA
+func (ca *CA) SignCert(csr *x509.Certificate) (*x509.Certificate, error) {
+	if csr.IsCA {
+		return nil, fmt.Errorf("sign: can't add new intermediate CA without key")
+	}
+
+	var isServer bool = true
+	for i := range csr.ExtKeyUsage {
+		ku := csr.ExtKeyUsage[i]
+		if ku == x509.ExtKeyUsageClientAuth {
+			isServer = false
+			break
+		}
+	}
+
+	if len(csr.SubjectKeyId) == 0 {
+		mb, err := x509.MarshalPKIXPublicKey(csr.PublicKey)
+		if err != nil {
+			return nil, fmt.Errorf("can't marshal CSR Public Key: %w", err)
+		}
+		csr.SubjectKeyId = hash(mb)
+	}
+
+	serial, err := ca.db.NewSerial()
+	if err != nil {
+		return nil, err
+	}
+
+	csr.SerialNumber = serial
+	csr.BasicConstraintsValid = true
+	csr.MaxPathLenZero = true
+	csr.MaxPathLen = -1
+
+	der, err := x509.CreateCertificate(rand.Reader, csr, ca.Certificate, csr.PublicKey, ca.key)
+	if err != nil {
+		return nil, fmt.Errorf("%s: can't sign cert: %w", csr.Subject.CommonName, err)
+	}
+	crt, err := x509.ParseCertificate(der)
+	if err != nil {
+		panic(err)
+	}
+
+	ck := &Cert{
+		Certificate: crt,
+		Key:         nil,
+	}
+
+	if isServer {
+		err = ca.db.StoreServerCert(ck, "")
+	} else {
+		err = ca.db.StoreClientCert(ck, "")
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return crt, nil
+}
+
 // RevokeCA revokes a given intermediate CA
 // We don't allow for the root-ca to be revoked.
 func (ca *CA) RevokeCA(cn string) error {
@@ -218,6 +303,17 @@ func (ca *CA) IsRevokedCA(xca *CA) (bool, error) {
 		return true, nil
 	}
 	return false, nil
+}
+
+// Export Entire DB as a JSON
+func (ca *CA) ExportJSON(wr io.Writer) error {
+	js, err := ca.db.ExportJSON()
+	if err != nil {
+		return err
+	}
+
+	_, err = wr.Write([]byte(js))
+	return err
 }
 
 // Find _all_ entities in the system: client certs, server certs and intermediate certs
@@ -450,9 +546,9 @@ func (ca *CA) ListRevoked() (map[string]Revoked, error) {
 	err := ca.db.MapRevoked(func(t time.Time, c *Cert) {
 		key := fmt.Sprintf("%x", c.SubjectKeyId)
 		m[key] = Revoked{
-				Cert: c,
-				When: t,
-			}
+			Cert: c,
+			When: t,
+		}
 	})
 
 	return m, err
@@ -578,7 +674,6 @@ func (ca *CA) IsValid() bool {
 	return true
 }
 
-
 // -- CA internal functions --
 
 func isRevoked(m map[string]*CA, rca *CA, skid []byte) bool {
@@ -616,8 +711,6 @@ type revoked struct {
 	when time.Time
 }
 
-
-
 // validate a cert against expiry
 func (ca *CA) validate(c *Cert) (*Cert, error) {
 	now := ca.clock.Now()
@@ -649,6 +742,8 @@ func (ca *CA) findCAs() (map[string]*CA, *CA, error) {
 	}
 	rca.parent = rca
 
+	assert(rca.key != nil, "root-ca key is nil")
+
 	// map of SubjectKeyId to the cert
 	m := make(map[string]*CA)
 
@@ -663,6 +758,7 @@ func (ca *CA) findCAs() (map[string]*CA, *CA, error) {
 			return nil
 		}
 
+		assert(s.Key != nil, "ica-ca %s key is nil", s.Subject.CommonName)
 		m[key] = &CA{
 			Certificate: s.Certificate,
 			Expired:     s.Expired,
@@ -870,6 +966,59 @@ func createRootCA(cfg *Config, clk clock, db Storage) (*Cert, error) {
 	return ck, nil
 }
 
+// Given a Cert, a raw key block and a password, decrypt the privatekey
+// and set it to c.Key
+func (c *Cert) decryptKey(key []byte, pw string) error {
+	blk, _ := pem.Decode(key)
+
+	var der []byte = blk.Bytes
+	var err error
+
+	if x509.IsEncryptedPEMBlock(blk) {
+		pass := []byte(pw)
+		der, err = x509.DecryptPEMBlock(blk, pass)
+		if err != nil {
+			return fmt.Errorf("can't decrypt private key (pw=%s): %s", pw, err)
+		}
+	}
+
+	sk, err := x509.ParseECPrivateKey(der)
+	if err == nil {
+		c.Key = sk
+	}
+
+	return err
+}
+
+// given a Cert, marshal the private key and return as bytes
+func (c *Cert) encryptKey(pw string) ([]byte, error) {
+	if c.Key == nil {
+		// XXX Do we validate if this exists?
+		return c.Rawkey, nil
+	}
+
+	derkey, err := x509.MarshalECPrivateKey(c.Key)
+	if err != nil {
+		return nil, fmt.Errorf("can't marshal private key: %s", err)
+	}
+
+	var blk *pem.Block
+	if len(pw) > 0 {
+		pass := []byte(pw)
+		blk, err = x509.EncryptPEMBlock(rand.Reader, "EC PRIVATE KEY", derkey, pass, x509.PEMCipherAES256)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		blk = &pem.Block{
+			Type:  "EC PRIVATE KEY",
+			Bytes: derkey,
+		}
+	}
+
+	return pem.EncodeToMemory(blk), nil
+}
+
 // default system clock
 type sysClock struct{}
 
@@ -880,6 +1029,22 @@ func newSysClock() clock {
 
 func (c *sysClock) Now() time.Time {
 	return time.Now().UTC()
+}
+
+func assert(cond bool, msg string, args ...interface{}) {
+	if cond {
+		return
+	}
+
+	_, file, line, ok := runtime.Caller(1)
+	if !ok {
+		file = "???"
+		line = 0
+	}
+
+	s := fmt.Sprintf(msg, args...)
+	s = fmt.Sprintf("%s:%d: Assertion failed!\n%s\n", file, line, s)
+	panic(s)
 }
 
 // vim: ft=go:noexpandtab:sw=8:ts=8

@@ -11,14 +11,25 @@ package pki
 // Internal details:
 //
 // * All data written to the db is encrypted with a key derived from a
-//   random 32-byte key.
+//   random 32-byte key (via AEAD AES-256-GCM) "db.key". We also store
+//   a 32-byte salt used for KDF and other enc/dec operations.
 // * This DB key is stored in an encrypted form in the DB; it is encrypted
 //   with a user supplied passphrase:
-//     dbkey = randbytes(32)
+//     db.key = randbytes(32)
+//     db.salt = randbytes(32)
 //     expanded = SHA512(passphrase)
-//     kek = KDF(expanded, salt)
-//     esk = kek ^ dbkey
-//
+//     kek = KDF(expanded, db.salt)
+//     esk = AES-256-GCM(db.key, kek)
+//  * EC Private keys are optionally encrypted with a user supplied passphrase
+//    (if provided) before being stored in the DB
+//  * Almost _all_ artifacts stored in the DB are AEAD encrypted:
+//     nonce = randbytes(16)
+//     kdfsalt = sha256(nonce, db.salt)
+//     encKey =  HKDF(db.key, kdfsalt)
+//     encbytes = AES-256-GCM(plaintext, enckey, nonce)
+//  * The only artifacts not encrypted are:
+//     DB Version
+//     Salt
 // * Updating serial#: anytime a user cert or a server cert is written,
 //   we update the serial number at the same time. We also update serial
 //   number when CA is created for the first time.
@@ -30,10 +41,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
-	"crypto/subtle"
 	"crypto/x509"
+	"encoding/binary"
 	"encoding/gob"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	bolt "github.com/etcd-io/bbolt"
@@ -43,6 +53,17 @@ import (
 	"sync"
 	"time"
 )
+
+// DB Version. This must be updated whenever we change the schema
+const DBVersion uint32 = 1
+
+type dbConfig struct {
+	Name   string
+	Passwd string
+
+	Json   string
+	Create bool
+}
 
 type db struct {
 	db   *bolt.DB
@@ -57,12 +78,6 @@ type db struct {
 	// set to true if CA has been initialized
 	initialized bool
 }
-
-type cadata struct {
-	Cert
-	serial *big.Int
-}
-
 
 type revokedgob struct {
 	// encrypted, gob-encoded cert block
@@ -80,11 +95,12 @@ type certgob struct {
 }
 
 // Create or open a boltbd instance containing the certs
-func openBoltDB(fn string, clk clock, pw string, creat bool) (Storage, error) {
+func openBoltDB(dbc *dbConfig, clk clock) (Storage, error) {
+	fn := dbc.Name
 	fi, _ := os.Stat(fn)
 	switch {
 	case fi == nil:
-		if !creat {
+		if !dbc.Create {
 			return nil, fmt.Errorf("can't open DB %s", fn)
 		}
 		dbdir := path.Dir(fn)
@@ -104,13 +120,10 @@ func openBoltDB(fn string, clk clock, pw string, creat bool) (Storage, error) {
 		return nil, fmt.Errorf("db %s: %w", fn, err)
 	}
 
-	var salt []byte
-	var pwd [32]byte
-	var saltb [32]byte
 	var epw [sha512.Size]byte
 
 	h := sha512.New()
-	h.Write([]byte(pw))
+	h.Write([]byte(dbc.Passwd))
 	expanded := h.Sum(epw[:0])
 
 	buckets := []string{
@@ -137,62 +150,54 @@ func openBoltDB(fn string, clk clock, pw string, creat bool) (Storage, error) {
 			}
 		}
 
+		// create or read as appropriate
+
 		skey := []byte("salt")
-		ckey := []byte("check")
 		pkey := []byte("ekey")
 		nkey := []byte("serial")
-
-		var cksum [sha256.Size]byte
-		var serial *big.Int
+		vkey := []byte("version")
 
 		b := tx.Bucket([]byte("config"))
 		if b == nil {
 			return fmt.Errorf("%s: can't find config bucket", fn)
 		}
 
-		salt = b.Get(skey)
-		chk := b.Get(ckey)
+		salt := b.Get(skey)
 		ekey := b.Get(pkey)
 		sbytes := b.Get(nkey)
-		if salt == nil || chk == nil || ekey == nil || sbytes == nil ||
-			len(ekey) != 32 || len(chk) != sha256.Size || len(salt) != 32 {
-			
-			var ekeyb [32]byte
-			var err error
+		ver := b.Get(vkey)
+		d.salt = make([]byte, 32)
+		if salt == nil || ekey == nil || sbytes == nil || ver == nil ||
+			len(salt) != 32 || len(ver) != 4 {
 
-			serial = randSerial()
-			ekey = ekeyb[:]
+			var vers [4]byte
+
+			d.pwd = make([]byte, 32)
+			d.serial = randSerial()
+
+			binary.LittleEndian.PutUint32(vers[:], DBVersion)
+			ver := vers[:]
 
 			// generate a random DB key and encrypt it with the user supplied key
+			randbytes(d.pwd)
+			randbytes(d.salt)
 
-			randbytes(pwd[:])
-			salt = randbytes(saltb[:])
-			kek := kdf(expanded, salt)
-			for i := 0; i < 32; i++ {
-				ekey[i] = kek[i] ^ pwd[i]
+			kek := kdf(expanded, d.salt)
+
+			ekey, err := aeadEncrypt(d.pwd, kek, d.salt, ver)
+			if err != nil {
+				return fmt.Errorf("%s: can't encrypt DB password: %w", fn, err)
 			}
 
-			d.salt = salt
-			d.pwd = pwd[:]
-			d.serial = serial
-
-			h := sha256.New()
-			h.Write(salt)
-			h.Write(kek)
-			chk = h.Sum(cksum[:0])
-
-			sbytes, err = d.encrypt(serial.Bytes())
+			sbytes, err = d.encrypt(d.serial.Bytes())
 			if err != nil {
 				return fmt.Errorf("root-ca: can't encrypt serial#: %w", err)
 			}
 
-			if err = b.Put(skey, salt); err != nil {
+			if err = b.Put(skey, d.salt); err != nil {
 				return fmt.Errorf("%s: can't write salt: %w", fn, err)
 			}
-			if err = b.Put(ckey, chk); err != nil {
-				return fmt.Errorf("%s: can't write checksum: %w", fn, err)
-			}
-			if err = b.Put(pkey, ekey[:]); err != nil {
+			if err = b.Put(pkey, ekey); err != nil {
 				return fmt.Errorf("%s: can't write E-key: %w", fn, err)
 			}
 
@@ -200,28 +205,30 @@ func openBoltDB(fn string, clk clock, pw string, creat bool) (Storage, error) {
 				return fmt.Errorf("%s: can't write serial: %w", fn, err)
 			}
 
+			if err = b.Put(vkey, vers[:]); err != nil {
+				return fmt.Errorf("%s: can't write version#: %w", fn, err)
+			}
+
 			return nil
+		}
+
+		// check the version#
+		dbver := binary.LittleEndian.Uint32(ver)
+		if dbver != DBVersion {
+			return fmt.Errorf("%s: Incorrect DB version (exp %d, want %d)", fn, DBVersion, dbver)
 		}
 
 		// This may be an initialized DB. Lets verify it.
 		kek := kdf(expanded, salt)
 
-		h := sha256.New()
-		h.Write(salt)
-		h.Write(kek)
-		vrfy := h.Sum(cksum[:0])
-
-		if subtle.ConstantTimeCompare(chk, vrfy) != 1 {
-			return fmt.Errorf("%s: wrong password", fn)
+		key, err := aeadDecrypt(ekey, kek, salt, ver)
+		if err != nil {
+			return fmt.Errorf("%s: wrong password?", fn)
 		}
 
-		// finally decode the encrypted DB key
-		for i := 0; i < 32; i++ {
-			pwd[i] = ekey[i] ^ kek[i]
-		}
-
-		d.salt = salt
-		d.pwd = pwd[:]
+		// we have to copy the salt -- it will be unmapped after this transaction ends
+		copy(d.salt, salt)
+		d.pwd = key
 
 		// we need the passwd & salt initialized before this decrypt.
 		sb, err := d.decrypt(sbytes)
@@ -229,54 +236,41 @@ func openBoltDB(fn string, clk clock, pw string, creat bool) (Storage, error) {
 			return fmt.Errorf("%s: can't decrypt serial: %s", fn, err)
 		}
 		d.serial = big.NewInt(0).SetBytes(sb)
-
 		return nil
 	})
 
-	if err != nil {
-		return nil, err
+	if len(dbc.Json) > 0 {
+		err = d.importJson(dbc.Json)
 	}
 
-	return d, nil
+	// Always return the DB; we need to properly close it regardless of error.
+	return d, err
 }
 
 // Change the DB encryption key to 'newpw'
 func (d *db) Rekey(newpw string) error {
-	var pwb [sha512.Size]byte
-	var cksum [sha256.Size]byte
-	var ekey [32]byte
+	var epw [sha512.Size]byte
+	var vers [4]byte
 
 	h := sha512.New()
 	h.Write([]byte(newpw))
-	newpwd := h.Sum(pwb[:0])
+	expanded := h.Sum(epw[:0])
+	kek := kdf(expanded, d.salt)
 
-	// New KEK
-	kek := kdf(newpwd, d.salt)
-	for i := 0; i < 32; i++ {
-		ekey[i] = kek[i] ^ d.pwd[i]
-		kek[i] = 0
+	binary.LittleEndian.PutUint32(vers[:], DBVersion)
+	ekey, err := aeadEncrypt(d.pwd, kek, d.salt, vers[:])
+	if err != nil {
+		return fmt.Errorf("rekey: can't re-encrypt DB password: %w", err)
 	}
 
-	h = sha256.New()
-	h.Write(d.salt)
-	h.Write(kek)
-	chk := h.Sum(cksum[:0])
-
-	err := d.db.Update(func(tx *bolt.Tx) error {
+	err = d.db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket([]byte("config"))
 		if b == nil {
 			return ErrNoConfigBucket
 		}
 
-		ckey := []byte("check")
-		pkey := []byte("ekey")
-
-		if err := b.Put(ckey, chk); err != nil {
-			return fmt.Errorf("rekey: can't write checksum: %w", err)
-		}
-
-		if err := b.Put(pkey, ekey[:]); err != nil {
-			return fmt.Errorf("rekey: can't write E-key: %w", err)
+		if err := b.Put([]byte("ekey"), ekey); err != nil {
+			return fmt.Errorf("rekey: can't write encrypted-key: %w", err)
 		}
 		return nil
 	})
@@ -286,9 +280,10 @@ func (d *db) Rekey(newpw string) error {
 // close the DB. No other methods can work without re-opening the db
 func (d *db) Close() error {
 	// wipe the keys
-	for i := 0; i < 32; i++ {
+	for i := range d.pwd {
 		d.pwd[i] = 0
 	}
+	d.pwd = nil
 	d.salt = nil
 	d.serial = nil
 	return d.db.Close()
@@ -313,31 +308,13 @@ func (d *db) NewSerial() (*big.Int, error) {
 	d.serial.Add(d.serial, z)
 	z.Set(d.serial)
 
-	es, err := d.encrypt(d.serial.Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("update-serial: %w", err)
-	}
-
-	err = d.db.Update(func(tx *bolt.Tx) error {
-		bu := tx.Bucket([]byte("config"))
-		if bu == nil {
-			return ErrNoConfigBucket
-		}
-
-		if err := bu.Put([]byte("serial"), es); err != nil {
-			return fmt.Errorf("update-serial: %w", err)
-		}
-		return nil
-	})
-
-	return z, err
+	return z, d.storeSerial(d.serial)
 }
 
 // Fetch the root CA
 func (d *db) GetRootCA() (*Cert, error) {
 	var c *Cert
 
-	pw := fmt.Sprintf("%x", d.pwd)
 	err := d.db.View(func(tx *bolt.Tx) error {
 		bc := tx.Bucket([]byte("config"))
 		if bc == nil {
@@ -359,7 +336,7 @@ func (d *db) GetRootCA() (*Cert, error) {
 			return fmt.Errorf("root-ca: can't decode: %w", err)
 		}
 
-		err = c.decryptKey(c.Rawkey, pw)
+		err = c.decryptKey(c.Rawkey, "")
 		if err != nil {
 			return fmt.Errorf("root-ca: can't decrypt key: %w", err)
 		}
@@ -373,8 +350,7 @@ func (d *db) GetRootCA() (*Cert, error) {
 
 // Store a new root CA
 func (d *db) StoreRootCA(c *Cert) error {
-	pw := fmt.Sprintf("%x", d.pwd)
-	b, err := c.marshal(pw)
+	b, err := d.marshalCert(c, "")
 	if err != nil {
 		return fmt.Errorf("root-ca: can't marshal: %w", err)
 	}
@@ -402,9 +378,7 @@ func (d *db) StoreRootCA(c *Cert) error {
 
 // Fetch given intermediate CA
 func (d *db) GetICA(nm string) (*Cert, error) {
-
-	pw := fmt.Sprintf("%x", d.pwd)
-	ck, err := d.getCert(nm, "ica", pw)
+	ck, err := d.getCert(nm, "ica", "")
 	if err != nil {
 		return nil, err
 	}
@@ -415,42 +389,26 @@ func (d *db) GetICA(nm string) (*Cert, error) {
 
 // Store the given intermediate CA
 func (d *db) StoreICA(c *Cert) error {
-	pw := fmt.Sprintf("%x", d.pwd)
-	return d.storeCert(c, "ica", pw)
+	return d.storeCert(c, "ica", "")
 }
 
 // Fetch the given client cert
 func (d *db) GetClientCert(nm string, pw string) (*Cert, error) {
-	ck, err := d.getCert(nm, "client", pw)
-	if err != nil {
-		return nil, err
-	}
-	return ck, nil
+	return d.getCert(nm, "client", pw)
 }
 
 // Store the given client cert
 func (d *db) StoreClientCert(c *Cert, pw string) error {
-	if len(pw) == 0 {
-		pw = fmt.Sprintf("%x", d.pwd)
-	}
-
 	return d.storeCert(c, "client", pw)
 }
 
 // Fetch the given server cert
 func (d *db) GetServerCert(nm string, pw string) (*Cert, error) {
-	ck, err := d.getCert(nm, "server", pw)
-	if err != nil {
-		return nil, err
-	}
-	return ck, nil
+	return d.getCert(nm, "server", pw)
 }
 
 // Store the given server cert
 func (d *db) StoreServerCert(c *Cert, pw string) error {
-	if len(pw) == 0 {
-		pw = fmt.Sprintf("%x", d.pwd)
-	}
 	return d.storeCert(c, "server", pw)
 }
 
@@ -565,7 +523,6 @@ func (d *db) FindRevoked(skid []byte) (time.Time, *Cert, error) {
 
 // -- helper functions --
 
-
 // iterate over all certs in a given bucket
 func (d *db) mapCerts(table string, fp func(c *Cert) error) error {
 	err := d.db.View(func(tx *bolt.Tx) error {
@@ -587,6 +544,13 @@ func (d *db) mapCerts(table string, fp func(c *Cert) error) error {
 			if table == "server" {
 				c.IsServer = true
 			}
+			if table == "ica" {
+				// ICA's don't use any password
+				err = c.decryptKey(c.Rawkey, "")
+				if err != nil {
+					return fmt.Errorf("%s: can't decrypt key: %w", table, err)
+				}
+			}
 
 			fp(c)
 			return nil
@@ -600,7 +564,7 @@ func (d *db) mapCerts(table string, fp func(c *Cert) error) error {
 
 func (d *db) storeCert(c *Cert, table, pw string) error {
 	cn := c.Subject.CommonName
-	b, err := c.marshal(pw)
+	b, err := d.marshalCert(c, pw)
 	if err != nil {
 		return fmt.Errorf("%s: can't marshal cert: %w", cn, err)
 	}
@@ -690,8 +654,8 @@ func (d *db) delCert(cn string, table string) error {
 		}
 
 		rg := revokedgob{
-			Cert:	gb,
-			When:   d.clock.Now(),
+			Cert: gb,
+			When: d.clock.Now(),
 		}
 
 		var b bytes.Buffer
@@ -718,6 +682,33 @@ func (d *db) delCert(cn string, table string) error {
 	})
 
 	return err
+}
+
+// marshal a Cert into a gob stream
+func (d *db) marshalCert(c *Cert, pw string) ([]byte, error) {
+	sn := c.Subject.CommonName
+	if c.Raw == nil {
+		return nil, fmt.Errorf("%s: Raw cert is nil?", sn)
+	}
+	key, err := c.encryptKey(pw)
+	if err != nil {
+		return nil, err
+	}
+
+	cg := &certgob{
+		Cert:       c.Raw,
+		Key:        key,
+		Additional: c.Additional,
+	}
+
+	var b bytes.Buffer
+	g := gob.NewEncoder(&b)
+	err = g.Encode(cg)
+	if err != nil {
+		return nil, fmt.Errorf("%s: can't gob-encode cert: %s", sn, err)
+	}
+
+	return b.Bytes(), nil
 }
 
 // Decode a serialized cert/key pair
@@ -750,87 +741,26 @@ func (d *db) unmarshalCert(cn string, ub []byte) (*Cert, error) {
 	return ck, nil
 }
 
-// Given a Cert, a raw key block and a password, decrypt the privatekey
-// and set it to c.Key
-func (c *Cert) decryptKey(key []byte, pw string) error {
-	blk, _ := pem.Decode(key)
+// store the given serial# in the DB
+func (d *db) storeSerial(serial *big.Int) error {
+	es, err := d.encrypt(serial.Bytes())
+	if err != nil {
+		return fmt.Errorf("update-serial: %w", err)
+	}
 
-	var der []byte = blk.Bytes
-	var err error
-
-	if x509.IsEncryptedPEMBlock(blk) {
-		pass := []byte(pw)
-		der, err = x509.DecryptPEMBlock(blk, pass)
-		if err != nil {
-			return fmt.Errorf("can't decrypt private key (pw=%s): %s", pw, err)
+	err = d.db.Update(func(tx *bolt.Tx) error {
+		bu := tx.Bucket([]byte("config"))
+		if bu == nil {
+			return ErrNoConfigBucket
 		}
-	}
 
-	sk, err := x509.ParseECPrivateKey(der)
-	if err == nil {
-		c.Key = sk
-	}
+		if err := bu.Put([]byte("serial"), es); err != nil {
+			return fmt.Errorf("update-serial: %w", err)
+		}
+		return nil
+	})
 
 	return err
-}
-
-// given a Cert, marshal the private key and return as bytes
-func (c *Cert) encryptKey(pw string) ([]byte, error) {
-	if c.Key == nil {
-		return nil, fmt.Errorf("privatkey is nil")
-	}
-
-	derkey, err := x509.MarshalECPrivateKey(c.Key)
-	if err != nil {
-		return nil, fmt.Errorf("can't marshal private key: %s", err)
-	}
-
-	var blk *pem.Block
-	if len(pw) > 0 {
-		pass := []byte(pw)
-		blk, err = x509.EncryptPEMBlock(rand.Reader, "EC PRIVATE KEY", derkey, pass, x509.PEMCipherAES256)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		blk = &pem.Block{
-			Type:  "EC PRIVATE KEY",
-			Bytes: derkey,
-		}
-	}
-
-	return pem.EncodeToMemory(blk), nil
-}
-
-// marshal a Cert into a gob stream
-func (c *Cert) marshal(pw string) ([]byte, error) {
-	sn := c.Subject.CommonName
-	if c.Raw == nil {
-		return nil, fmt.Errorf("%s: Raw cert is nil?", sn)
-	}
-	if len(pw) == 0 {
-		return nil, fmt.Errorf("%s: Enc key is empty", sn)
-	}
-
-	key, err := c.encryptKey(pw)
-	if err != nil {
-		return nil, err
-	}
-
-	cg := &certgob{
-		Cert:       c.Raw,
-		Key:        key,
-		Additional: c.Additional,
-	}
-
-	var b bytes.Buffer
-	g := gob.NewEncoder(&b)
-	err = g.Encode(cg)
-	if err != nil {
-		return nil, fmt.Errorf("%s: can't gob-encode cert: %s", sn, err)
-	}
-
-	return b.Bytes(), nil
 }
 
 // hash publickey; we use it as a salt for encryption and also SubjectKeyId
