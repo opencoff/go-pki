@@ -15,7 +15,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	bolt "github.com/etcd-io/bbolt"
+	bolt "go.etcd.io/bbolt"
 	"math/big"
 	"time"
 )

@@ -46,7 +46,7 @@ import (
 	"encoding/gob"
 	"errors"
 	"fmt"
-	bolt "github.com/etcd-io/bbolt"
+	bolt "go.etcd.io/bbolt"
 	"math/big"
 	"os"
 	"path"
