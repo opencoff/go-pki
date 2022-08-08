@@ -385,12 +385,11 @@ func (d *db) StoreRootCA(c *Cert) error {
 // Fetch given intermediate CA
 func (d *db) GetICA(nm string) (*Cert, error) {
 	ck, err := d.getCert(nm, "ica", "")
-	if err != nil {
-		return nil, err
+	if err == nil {
+		ck.IsCA = true
 	}
 
-	ck.IsCA = true
-	return ck, nil
+	return ck, err
 }
 
 // Store the given intermediate CA
@@ -410,7 +409,11 @@ func (d *db) StoreClientCert(c *Cert, pw string) error {
 
 // Fetch the given server cert
 func (d *db) GetServerCert(nm string, pw string) (*Cert, error) {
-	return d.getCert(nm, "server", pw)
+	ck, err := d.getCert(nm, "server", pw)
+	if err == nil {
+		ck.IsServer = true
+	}
+	return ck, err
 }
 
 // Store the given server cert
@@ -551,6 +554,8 @@ func (d *db) mapCerts(table string, fp func(c *Cert) error) error {
 				c.IsServer = true
 			}
 			if table == "ica" {
+				c.IsCA = true
+
 				// ICA's don't use any password
 				err = c.decryptKey(c.Rawkey, "")
 				if err != nil {
