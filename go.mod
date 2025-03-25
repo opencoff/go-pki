@@ -1,10 +1,10 @@
 module github.com/opencoff/go-pki
 
-go 1.23.4
+go 1.24.0
 
 require (
-	go.etcd.io/bbolt v1.3.11
-	golang.org/x/crypto v0.32.0
+	go.etcd.io/bbolt v1.4.0
+	golang.org/x/crypto v0.36.0
 )
 
-require golang.org/x/sys v0.29.0 // indirect
+require golang.org/x/sys v0.31.0 // indirect

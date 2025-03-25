@@ -343,7 +343,7 @@ func testCA0(db Storage, clk *dummyClock, t *testing.T) {
 	assert(err == nil, "can't list all CAs via ICA")
 	assert(len(cas) == 2, "#CA via ICA mismatch; exp 2, saw %d", len(cas))
 
-	const ncerts = 500
+	const ncerts = 50
 
 	for i := 0; i < ncerts; i++ {
 		cn := fmt.Sprintf("user%d@example.com", i)

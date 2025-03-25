@@ -103,5 +103,3 @@ func TestJsonv1Export(t *testing.T) {
 	assert(err == nil, "can't get ca2-clients: %s", err)
 	assert(len(clis) == len(cli2), "client certs mismatch; exp %d, saw %d", len(clis), len(cli2))
 }
-
-
