@@ -25,14 +25,16 @@ Everything is `crypto/x509` plus policy. **No non-stdlib dependencies.**
 - Consume CSRs and return signed certificates under an explicit profile.
 - Support an externally attested root of trust without requiring the tenant to
   grant a subordinate CA.
-- Keep private keys sealed at rest; support HSM/KMS custody at any node.
-- Make the hot path (certificate issuance) independent of storage.
+- **Hold no storage.** The library is strictly in-memory; the entire regime
+  serializes to a single sealed blob the host persists however it likes.
+- Make the hot path (certificate issuance) independent of everything above.
 
 ### Non-goals
 
 - Public-web PKI. No CT, no CAA, no ACME.
 - Post-quantum or SHA3 *signatures* — not reachable via stdlib (§7).
 - Being a certificate transparency log, an OCSP responder, or a TLS stack.
+- Defining a storage interface. There is none (§8).
 
 ---
 
@@ -43,20 +45,24 @@ Two layers, dependency pointing one way.
 ```
    ┌─────────────────────────────────────────────┐
    │ Regime          control plane               │
-   │   hierarchy, Store, seed, anchor, ceremonies │
-   │   rare; provisioning path                    │
+   │   hierarchy, anchor, ceremonies, CRL state   │
+   │   in memory; Seal()s to one blob             │
    └────────────────────┬────────────────────────┘
                         │ LeafCA.Issuer()
    ┌────────────────────▼────────────────────────┐
    │ Issuer          data plane                  │
-   │   stateless CSR signing; no Store, no seed   │
+   │   stateless CSR signing; no regime state     │
    │   frequent; hot path                         │
+   └─────────────────────────────────────────────┘
+                        │ Regime.TrustedRoot()
+   ┌────────────────────▼────────────────────────┐
+   │ TrustedRoot     the other side of the wire  │
+   │   marshalable trust config; Verify() only    │
    └─────────────────────────────────────────────┘
 ```
 
-An issuing service needs only a leaf-CA key, its chain, and a policy. It does
-not need a Store, a seed, or knowledge that a Regime exists. This is what lets
-the root live offline while issuance runs continuously.
+An issuing service needs only a leaf-CA key, its chain, and a policy. A relying
+party needs only a `TrustedRoot`. Neither needs the Regime.
 
 ---
 
@@ -68,11 +74,14 @@ the root live offline while issuance runs continuously.
 | **Intermediate** | A CA between the root and a leaf CA. May issue further CAs. |
 | **LeafCA** | Terminal CA. Issues end-entity certificates only. `pathlen 0`. |
 | **Issuer** | Stateless signing façade produced by a LeafCA. |
-| **anchorCert** | A tenant-signed **end-entity** certificate carrying `hash(rootCert)`. Not in any signing path. |
+| **anchorCert** | A tenant-signed **end-entity** certificate carrying the root attestation. Not in any signing path. |
 | **RoT_Hash** | `SHA-256(rootCert.Raw)`. Embedded in anchorCert by the tenant CA. |
+| **RoT_Sig** | Root's signature proving it consented to being named by this anchor (§4.4). |
 | **AnchorHash** | `SHA-256(anchorCert.Raw)`. Embedded in every certificate the regime issues. |
 | **Depth (D)** | Number of CA levels, rootCert..LeafCA inclusive. Fixed at creation. `D >= 2`. |
 | **Bundle** | Shippable set: leaf, its chain to rootCert, anchorCert, its chain to the tenant root. |
+| **TrustedRoot** | Marshalable trust configuration exported to relying parties. |
+| **sealing key** | Caller-supplied 32 bytes protecting the serialized regime. Typically KMS-held. |
 
 ---
 
@@ -87,7 +96,7 @@ joined by a pair of hash references:
   Tenant Root CA                         rootCert  (self-signed)
        │ signs                                │ signs
        ▼                                      ▼
-  anchorCert  ◄── RoT_Hash ──────────────  Intermediate…
+  anchorCert  ◄── RoT_Hash + RoT_Sig ────  Intermediate…
   (CA:FALSE)                                  │
        ▲                                      ▼
        └────────── AnchorHash ───────────  LeafCA
@@ -98,6 +107,8 @@ joined by a pair of hash references:
 
 - The tenant signs a statement containing `hash(rootCert)`. Only the tenant can
   produce it. **This is the approval.**
+- The root signs `RoT_Sig`, proving it consented. Only the root holder can
+  produce it. **This is the ownership proof.**
 - Every certificate the regime issues carries `hash(anchorCert)`, naming which
   attestation it was minted under.
 
@@ -132,7 +143,7 @@ PKI is a quarters-long political project; getting a leaf certificate is a ticket
 2. read AnchorHash from the leaf
 3. hash(bundle.Anchor) == AnchorHash
 4. anchorCert -> tenant root, + revocation    (tenant tree, standard X.509)
-5. read RoT_Hash from anchorCert
+5. read RoT_Hash + RoT_Sig from anchorCert; verify RoT_Sig under rootCert
 6. BACK-CHECK: RoT_Hash == hash(rootCert)
 ```
 
@@ -151,7 +162,45 @@ that ignores the marker entirely**, because it reports a trust property it never
 checked. The API therefore exposes no accessor that returns an attestation
 conclusion without having performed the back-check.
 
-### 4.4 Transitive trust — the payoff
+### 4.4 RoT_Sig: proving the root consented
+
+Without it, `RoT_Hash` is an **unauthenticated claim** — anyone may place any
+hash in their anchorCSR. The attack is a confused deputy: Mallory submits an
+anchorCSR containing `hash(rootCert_Alice)`; the tenant approves what it believes
+is Mallory's regime; the tenant now vouches for a root Mallory does not control,
+and relying parties in that tenant's domain begin accepting Alice's certificates.
+
+The anchorCSR proves possession of `anchorKey`. `RoT_Sig` extends
+proof-of-possession to `rootKey`:
+
+```
+RoT_Sig = Sign(rootSK,
+    SHA-256("ternstack/v1/rot-endorsement" || rootCert.Raw || anchorSPKI))
+```
+
+Three properties matter:
+
+- **It binds `anchorSPKI`, so it is non-transferable.** A signature over
+  `RoT_Hash` alone would be detachable — Mallory could lift Alice's signature
+  into Mallory's own CSR under Mallory's anchor key and it would still verify.
+- **It is domain-separated.** `rootSK` also signs certificates; a bare signature
+  over a digest must never be confusable with a TBSCertificate signature.
+- **`anchorSPKI` exists at signing time.** PKCS#10 has no serial number field —
+  serials are assigned by the CA at issuance — so a serial cannot be bound.
+
+**Who verifies it.** The tenant *should*, being the party protected, but
+realistically an enterprise CA validates the CSR signature, applies a profile,
+and never parses a custom OID. The value does not depend on that: **the relying
+party verifies `RoT_Sig` at step 5** using `rootCert`, which it already holds.
+Mallory cannot produce a valid signature, so the back-check catches the forgery
+even if the tenant copied the extension blindly. Verification is therefore
+mandatory at the relying party and advisory at the tenant.
+
+`RoT_Sig` is computed once, at the founding ceremony. Re-anchoring needs a fresh
+one only if `anchorKey` changes; reusing `anchorKey` across anchor renewals keeps
+the root asleep (§9.5).
+
+### 4.5 Transitive trust — the payoff
 
 A relying party may establish trust two ways:
 
@@ -165,7 +214,7 @@ The second mode is the reason the architecture exists. A workload configured
 only with the corporate root can accept certificates from a regime it was never
 told about.
 
-### 4.5 What this does NOT give you
+### 4.6 What this does NOT give you
 
 Stated plainly because it reads like a property of the certificate when it is a
 property of the verifier:
@@ -177,17 +226,20 @@ property of the verifier:
   under stock X.509 and is indistinguishable without step 6.
 - **The floor is not enforceable.** `pathLenConstraint` is a *maximum*; X.509 has
   no minimum-depth mechanism. "Intermediates must be present before a leaf CA"
-  is enforced by this library and by key custody, not by any verifier.
+  is enforced by this library, not by any verifier.
 - **A one-clause dependency on the tenant.** If the tenant's CA strips the
   extension, the design yields nothing. See §12.
+- **No rollback protection.** The host owns persistence, so restoring an older
+  sealed blob un-revokes certificates. The generation counter makes this
+  *detectable*; only the host can make it *impossible* (§8.4).
 
 ---
 
 ## 5. Hierarchy and the pathlen ladder
 
-`Depth D` is frozen at creation and recorded in the Store. `D >= 2`: at `D == 1`
-the root would issue end-entity certificates directly, defeating the invariant
-and forcing `Root` to grow an `Issuer()` method.
+`Depth D` is frozen at creation and recorded in the sealed regime. `D >= 2`: at
+`D == 1` the root would issue end-entity certificates directly, defeating the
+invariant and forcing `Root` to grow an `Issuer()` method.
 
 For a CA at level *i* (root = 1, LeafCA = D):
 
@@ -259,16 +311,15 @@ Clamping is never silent: issuance returns `EffectiveNotAfter`.
 
 A 10-year root has two consequences worth planning for: the **suite is frozen for
 a decade**, so root rotation must be a supported ceremony rather than an
-emergency; and the root key must be protected for ten years, which is why the
-cold-root property (§9.4) is the default rather than a discipline.
+emergency; and the sealing key must be protected for ten years (§8.5).
 
 ---
 
 ## 7. Suites
 
-A `Suite` pins algorithms by slot, is frozen at creation, recorded in the Store,
-and **re-validated against every certificate at open**. Validating only at
-issuance would let anyone with Store write access downgrade the regime.
+A `Suite` pins algorithms by slot, is frozen at creation, recorded in the sealed
+regime, and **re-validated against every certificate on open**. Validating only
+at issuance would let anyone able to substitute a blob downgrade the regime.
 
 ### 7.1 What is actually reachable
 
@@ -286,8 +337,8 @@ A PQC or SHA3 *signature* suite is therefore not implementable on stdlib today,
 and the IETF composite/hybrid drafts are still moving — committing an on-disk
 format to them now would be a durable mistake for certificates that live years.
 
-SHA3 *is* used internally for the seal KDF (§8), where no interop constraint
-applies.
+SHA3 *is* used for the seal KDF (§8.3) and the `RoT_Sig` digest, where no interop
+constraint applies.
 
 ### 7.2 FIPS
 
@@ -310,119 +361,112 @@ refactor.
 
 ---
 
-## 8. Storage and sealing
+## 8. Persistence: there isn't any
 
-### 8.1 Three orthogonal concerns
-
-| Concern | Interface | Backends |
-|---|---|---|
-| Where bytes live | `Store` | files, S3, etcd, SQL, Consul |
-| How the seed is protected | `SeedGuard` | Argon2id passphrase, KMS envelope, TPM |
-| How signing happens | `crypto.Signer` | in-process, PKCS#11, KMS, TPM |
-
-Custody is **per node, not per level**: the root may be HSM-resident while leaf
-CAs are sealed blobs.
-
-### 8.2 Store
+The library defines **no storage interface**. The entire regime serializes to one
+sealed blob; the host persists it in whatever database it already runs.
 
 ```go
-type Store interface {
-	Get(key string) ([]byte, error)
-	Put(key string, val []byte) error
-	Delete(key string) error
-	List(prefix string) ([]string, error)
+// Seal serializes the whole regime and encrypts it under key (32 bytes,
+// caller-supplied — typically KMS-held). The caller persists the result.
+func (r *Regime) Seal(key []byte) ([]byte, error)
 
-	// CAS updates key only if its current value matches old. Required for
-	// monotonic CRL numbers when more than one process writes.
-	CAS(key string, old, new []byte) error
-}
+// OpenRegime is a package-level constructor, not UnmarshalBinary: a Regime
+// carries invariants (suite conformance, the pathlen ladder, root pin, anchor
+// back-check) that must hold before the value exists, and a method-based
+// unmarshaler would require a half-constructed Regime to mutate toward validity.
+func OpenRegime(sealed, key []byte, o OpenOpts) (*Regime, error)
+
+// Generation is a monotonic counter, incremented on every Seal.
+func (r *Regime) Generation() uint64
+
+// PeekGeneration reads the generation WITHOUT the sealing key, so a host can
+// compare-and-swap on the blob without being able to decrypt it.
+func PeekGeneration(sealed []byte) (uint64, error)
 ```
 
-A dumb key/value store of opaque blobs. It never sees plaintext key material and
-never takes a passphrase. Records are keyed by **path or SKID, never by CN** —
-CN-keyed storage silently orphans a live, unrevocable certificate when a CN is
-re-issued.
+### 8.1 Why the caller supplies the sealing key
 
-### 8.3 Sealing
+Key provenance stays the caller's decision — KMS-generated, HSM-derived,
+whatever. A library-minted key would have to be returned from `Seal`, making an
+apparently idempotent method secretly create a secret, and would force the KMS
+copy to be updated on every write. Caller-supplied keeps the key stable across
+re-seals.
 
-The Regime generates a **64-byte root seed** at creation. Every secret is sealed
-with a key and nonce derived from that seed:
+### 8.2 What is in the blob
 
-```
-version = 1
-salt    = randbytes(16)
-prk     = HKDF-SHA3-512(seed, salt=salt, info=context, len=44)
-key     = prk[:32]
-nonce   = prk[32:44]
-blob    = version || salt || AES-256-GCM(key, nonce, plaintext, aad=version)
-```
+- `rootCert` + `rootKey`
+- every Intermediate and LeafCA, with keys
+- `anchorCert` and its chain to the tenant root
+- suite, depth, subject, policy
+- CRL state: revoked serials and per-issuer CRL numbers
 
-Overhead is 33 bytes per record.
+**Not** in the blob: issued end-entity certificates. Serials are 128 random bits
+with no counter, and `Revoke` takes a serial supplied by the caller, so there is
+nothing to retain. Blob size is therefore a handful of CA certificates plus a
+revocation list — kilobytes, and re-sealing the whole thing per mutation is
+cheap.
 
-**Why this beats plain random-nonce GCM.** Because the key is re-derived per
-operation, nonce reuse requires a 128-bit salt collision rather than the 96-bit
-nonce birthday bound. NIST's ~2³² invocations-per-key ceiling for GCM does not
-apply.
+**All operational CA keys live in the blob.** There is no per-node external-signer
+custody and no rebinding hook on open, because a resolver callback is exactly the
+storage-shaped complexity this model exists to remove. `anchorKey` is the one
+external key: it is KMS-resident, signs only the anchorCSR for proof-of-possession,
+and is never needed again once `anchorCert` is in the blob.
 
-**Context binding.** `info` carries the record's full identity:
-
-```
-ternstack/v1/ca-key/<path>
-ternstack/v1/crl-state/<path>
-ternstack/v1/anchor
-```
-
-This closes the M6 finding from the security audit of the old code, which used
-identical associated data for every record and therefore allowed an attacker with
-Store write access to relocate a blob between buckets and have it decrypt
-happily. Measured:
+### 8.3 Seal format
 
 ```
-same store, sibling CA slot  -> REJECTED: cipher: message authentication failed
-relocated to a CRL record    -> REJECTED: cipher: message authentication failed
+version(1) || generation(8) || salt(16) || AES-256-GCM(k, n, state, aad)
+
+k, n = HKDF-SHA3-512(sealingKey, salt=salt,
+                     info="ternstack/v1/regime", len=44)
+       k = prk[:32], n = prk[32:44]
+aad  = version || generation
+```
+
+Overhead is 41 bytes. The generation lives in the **cleartext** header so a host
+can read it without the key, and in the **AAD** so it cannot be forged.
+
+**Why not a fixed key plus a random nonce.** The regime is re-sealed on every
+mutation. With a fixed key you must guarantee nonce uniqueness across an
+unbounded number of writes, and random 96-bit nonces put you on a birthday bound
+that limits GCM to roughly 2³² invocations per key. Re-deriving the key from a
+fresh 16-byte salt each time means collision requires 128 bits instead, and NIST's
+per-key ceiling does not apply.
+
+The construction was validated end to end; the same context-separation and
+version-authentication behaviour holds:
+
+```
 flipped a ciphertext bit     -> REJECTED: cipher: message authentication failed
 flipped a salt bit           -> REJECTED: cipher: message authentication failed
 bumped the version byte      -> REJECTED: unknown seal version 2
+wrong info/context string    -> REJECTED: cipher: message authentication failed
 ```
 
-A misfiled blob now fails at key derivation, not merely at tag check.
+### 8.4 Concurrency and rollback
 
-**Versioning.** The version byte is authenticated as GCM AAD, so a format
-downgrade is detected rather than parsed as v1.
+**Single-writer is the normative model.** The hot path is `Issuer`, which is
+stateless and never touches regime state, so mutations (creating a CA, revoking)
+are rare. A host that needs more can compare-and-swap on `PeekGeneration`.
 
-### 8.4 SeedGuard
+**Rollback is the host's responsibility, and this is a real reduction in what the
+library guarantees.** Restoring an older blob un-revokes certificates and rewinds
+CRL numbers. The generation counter makes that detectable; nothing in the library
+can prevent it. Any deployment that treats revocation as security-relevant must
+enforce monotonicity in its own storage layer.
 
-```go
-// SeedGuard protects the regime's 64-byte root seed at rest. Called once on
-// open, never per record. The Regime never exposes the seed.
-type SeedGuard interface {
-	Protect(seed []byte) ([]byte, error)
-	Recover(protected []byte) ([]byte, error)
-}
-```
+### 8.5 Key handling
 
-Because the Regime owns the seed, the injectable contract shrinks from a
-general-purpose sealer invoked once per key to a **single-item guard invoked once
-at open**: one KMS round-trip per process rather than one per key, and all
-per-record crypto becomes local, fast, and deterministically testable.
+The sealing key protects everything — every CA private key in the regime. Two
+consequences:
 
-Two KMS-backed guards, deliberately distinguished:
-
-- `NewSecretStoreGuard` — the seed is fetched verbatim. The portable
-  least-common-denominator across platforms.
-- `NewKMSGuard` — envelope encryption; the seed never leaves the KMS unwrapped.
-  Costs a round-trip but gives the tenant an **access log and a revocation
-  lever**, the same kill-switch property the anchor provides.
-
-### 8.5 Two distinct rotation operations
-
-The old code conflated these — its `Rekey()` re-encrypted the KEK while claiming
-to rekey the database.
-
-```go
-func (r *Regime) ReprotectSeed(g SeedGuard) error // O(1): passphrase/KMS change
-func (r *Regime) RotateSeed() error               // O(n): re-seals every key
-```
+- **Sealing key and sealed blob must not share a backup.** Co-located, the seal
+  is decorative.
+- **"Cold root" is now an access-control property, not a custody property.**
+  Anyone who can open the regime holds the root key. Protecting the root means
+  restricting who can obtain the sealing key from the KMS, and opening the regime
+  only during ceremonies.
 
 ---
 
@@ -431,34 +475,31 @@ func (r *Regime) RotateSeed() error               // O(n): re-seals every key
 ### 9.1 Self-anchored
 
 ```go
-func NewRegime(cfg *Config, st Store, g SeedGuard) (*Regime, error)
+func NewRegime(cfg *Config) (*Regime, error)
 ```
 
-Generates the seed, generates `rootKey`, self-signs `rootCert` with
-`pathlen = D-1`. Issued certificates carry no `AnchorHash`.
+Generates `rootKey`, self-signs `rootCert` with `pathlen = D-1`. Issued
+certificates carry no `AnchorHash`. Nothing is persisted until `Seal`.
 
 ### 9.2 Tenant-anchored — a ceremony, not a constructor
 
 ```go
-func NewRegimeBuilder(cfg *Config, st Store, g SeedGuard,
-	anchorKey KeySource) (*RegimeBuilder, []byte, error)
-
-func ResumeRegimeBuilder(st Store, g SeedGuard) (*RegimeBuilder, error)
+func NewRegimeBuilder(cfg *Config, anchorKey crypto.Signer) (*RegimeBuilder, []byte, error)
 
 func (rb *RegimeBuilder) AnchorCSR() []byte
 func (rb *RegimeBuilder) RootHash() []byte
+func (rb *RegimeBuilder) Seal(key []byte) ([]byte, error)
+func OpenRegimeBuilder(sealed, key []byte) (*RegimeBuilder, error)
 func (rb *RegimeBuilder) Install(anchorCert []byte, caChain [][]byte) (*Regime, error)
-func (rb *RegimeBuilder) Discard() error
 ```
 
 The builder generates `rootKey`, self-signs `rootCert`, and produces an
-`anchorCSR` carrying `hash(rootCert.Raw)` under the regime OID. `anchorKey` is a
-separate key whose only purpose is CSR proof-of-possession; it typically lives in
-an HSM/KMS and signs nothing else.
+anchorCSR carrying `RoT_Hash` and `RoT_Sig` under the regime OID. `anchorKey` is
+a KMS-resident `crypto.Signer` whose only purpose is CSR proof-of-possession.
 
-**Both keys are sealed to the Store immediately.** The tenant round-trip runs on
-ticket-queue time; a process restart must not destroy an approval that took weeks
-to obtain. Hence `ResumeRegimeBuilder`.
+**The builder is sealable.** The tenant round-trip runs on ticket-queue time; a
+process restart must not destroy an approval that took weeks to obtain. The
+builder's blob uses `info = "ternstack/v1/builder"`.
 
 **Nothing can be issued before `Install`** — every issued certificate embeds
 `hash(anchorCert)`, so the anchor must exist first. The builder state is not
@@ -469,8 +510,9 @@ optional ceremony; it is a data dependency.
 1. `anchorCert.PublicKey` matches **`anchorKey`** (not `rootKey`)
 2. the regime OID is present and `RootHash == hash(rootCert.Raw)` →
    `ErrAttestationStripped`
-3. `caChain` verifies `anchorCert` to a self-signed root
-4. `anchorCert` is not revoked
+3. `RoT_Sig` verifies under `rootCert` over this anchor's SPKI
+4. `caChain` verifies `anchorCert` to a self-signed root
+5. `anchorCert` is not revoked
 
 Deliberately **not** required: subject DN preservation, `pathLenConstraint`,
 `CA:TRUE`. See §4.2.
@@ -478,29 +520,21 @@ Deliberately **not** required: subject DN preservation, `pathLenConstraint`,
 ### 9.3 Opening
 
 ```go
-func OpenRegime(st Store, g SeedGuard, pin RootPin) (*Regime, error)
+type OpenOpts struct {
+	Pin RootPin   // expected root identity, supplied OUT OF BAND
+	Now time.Time
+}
 ```
 
-`pin` supplies the expected root identity **out of band**. Everything else is
-validated against it; reading the anchor of trust from the Store would make Store
-write access a total compromise. Open also re-validates suite conformance and the
-pathlen ladder across every loaded certificate.
+`Pin` must not come from the same place as the blob; otherwise substituting the
+blob substitutes the trust anchor with it. Open also re-validates suite
+conformance and the pathlen ladder across every loaded certificate.
 
 There is no `create bool`. A boolean that switches between "read this" and
-"initialize this" is a latent data-loss bug — in the old code it is precisely
-what allowed a wrong password to silently overwrite a live root CA.
+"initialize this" is a latent data-loss bug — in the predecessor code it is
+precisely what allowed a wrong password to silently overwrite a live root CA.
 
-### 9.4 Cold root
-
-```go
-func (r *Regime) SealRoot() error
-```
-
-In the anchored model the root signs exactly twice — self-signing `rootCert`, and
-signing the top of the hierarchy. Over a 10-year span it should be cold by
-default, not by discipline.
-
-### 9.5 Re-anchoring
+### 9.4 Re-anchoring
 
 ```go
 func (r *Regime) Anchor() *Anchor
@@ -512,6 +546,9 @@ Anchors form a **series over one stable root**: anchor₁, anchor₂, … each c
 the identical `RoT_Hash`, each independently sufficient for the back-check. New
 leaves bind to the current anchor; leaf clamping (§6) means older leaves expire
 before their anchor does.
+
+Reusing `anchorKey` across renewals keeps `RoT_Sig` valid and avoids waking the
+root for each re-anchor.
 
 **Tenant-facing semantics that must be in the runbook:** revoking one anchorCert
 does **not** withdraw approval of the regime. It kills exactly the leaves issued
@@ -557,8 +594,8 @@ type Policy struct {
 ```
 
 `KeyEncipherment` is never set on an ECDSA certificate; it is meaningless there
-and its presence in the old code is a copy-forward mistake. `nsCertType` is
-dropped entirely.
+and its presence in the predecessor code is a copy-forward mistake. `nsCertType`
+is dropped entirely.
 
 ### 10.2 Issuer
 
@@ -614,7 +651,6 @@ type CASpec struct {
 	Subject         pkix.Name
 	Validity        time.Duration // clamped to parent NotAfter
 	NameConstraints *NameConstraints
-	Key             KeySource
 	Policy          Policy
 }
 
@@ -629,9 +665,9 @@ func (l *LeafCA) CRL(validFor time.Duration) ([]byte, error)
 ```
 
 Revocation is **per issuer**. A CRL signed by a non-issuer must be ignored by
-conforming verifiers; the old code signed one global list with whichever CA
-happened to be in hand. Each authority keeps its own set and monotonic CRL
-number, which is what `Store.CAS` exists for.
+conforming verifiers; the predecessor code signed one global list with whichever
+CA happened to be in hand. Each authority keeps its own set and monotonic CRL
+number in the sealed state.
 
 Name constraints deserve emphasis: with pathlen and EKU they are one of only
 three mechanisms a third-party verifier enforces. A per-tenant intermediate
@@ -647,14 +683,13 @@ type Config struct {
 	Validity time.Duration // root span, ~10y
 	Suite    Suite
 	Policy   Policy
-	RootKey  KeySource
 }
 
 func (r *Regime) Root() *Root
 func (r *Regime) Suite() Suite
 func (r *Regime) Depth() int
 func (r *Regime) Find(path string) (Authority, error)
-func (r *Regime) Close() error
+func (r *Regime) TrustedRoot() *TrustedRoot
 ```
 
 ---
@@ -666,9 +701,16 @@ func (r *Regime) Close() error
 ```
 TernstackRegimeInfo ::= SEQUENCE {
     version     INTEGER (1),
-    rootHash    [0] IMPLICIT OCTET STRING OPTIONAL,  -- in anchorCert
+    rootAttest  [0] IMPLICIT SEQUENCE {          -- in anchorCert
+        rootHash    OCTET STRING,                -- SHA-256(rootCert.Raw)
+        sigAlg      AlgorithmIdentifier,
+        rootSig     OCTET STRING                 -- §4.4
+    } OPTIONAL,
     anchorHash  [1] IMPLICIT OCTET STRING OPTIONAL } -- in certs we issue
 ```
+
+`sigAlg` is explicit rather than derived from suite knowledge, so a verifier
+holding only `rootCert` and the extension can check `RoT_Sig` unambiguously.
 
 Carried under a **private-arc OID** — `1.3.6.1.4.1.<PEN>.1`. A private arc is
 *less* non-standard than overloading a subject DN or SAN with custom content, and
@@ -685,7 +727,7 @@ is already recoverable from its issuer.
 
 ```go
 // ReadProvenance returns the UNVERIFIED marker. It is not a trust statement:
-// anyone holding any CA key can write any value here. Use VerifyBundle.
+// anyone holding any CA key can write any value here. Use TrustedRoot.Verify.
 func ReadProvenance(c *x509.Certificate) (Provenance, bool)
 ```
 
@@ -709,6 +751,53 @@ func (b *Bundle) PEM() []byte // human inspection only
 element is self-signed and that every element issued its predecessor — ordering
 is attacker-supplied and must not be assumed. The canonical form is a structured
 envelope; a flat PEM concatenation is ambiguous between the two chains.
+
+### 11.3 TrustedRoot
+
+What a Regime exports for the other side of the wire.
+
+```go
+type TrustedRoot struct {
+	Root          *x509.Certificate   // self-signed regime root
+	Intermediates []*x509.Certificate // every Intermediate and LeafCA
+
+	Anchor      *x509.Certificate   // nil when self-anchored
+	AnchorChain []*x509.Certificate // empty when self-anchored
+}
+
+func (r *Regime) TrustedRoot() *TrustedRoot
+
+// Verify runs the full six-step check of §4.3 against this trust config.
+// extra supplies any certificates the peer presented that are not embedded.
+func (t *TrustedRoot) Verify(c *x509.Certificate, o VerifyOpts,
+	extra ...*x509.Certificate) error
+
+// Fingerprint identifies this configuration for out-of-band pinning.
+func (t *TrustedRoot) Fingerprint() []byte
+
+func ParseTrustedRoot([]byte) (*TrustedRoot, error)
+func (t *TrustedRoot) MarshalBinary() ([]byte, error)
+func (t *TrustedRoot) UnmarshalBinary([]byte) error
+```
+
+**Certificates, not bare public keys.** With bare keys you lose subject DNs (so
+no path building), pathLenConstraint, name constraints, EKU nesting, validity
+windows, and serials for revocation matching — verification would degenerate to
+"is this signed by one of these keys," discarding nearly everything this design
+makes externally enforceable.
+
+**Serialization solves transport, not trust establishment.** A marshalable
+TrustedRoot is a *substitutable* TrustedRoot; delivered over an unauthenticated
+channel it is a trust-substitution vector, exactly the reasoning that puts
+`RootPin` out of band. `Fingerprint()` exists so deployments can pin it.
+
+Embedding `Intermediates` keeps `Verify` a one-argument call at the cost of
+redistribution when the hierarchy grows; `extra` covers the case where the peer
+supplies its own chain instead.
+
+When `Anchor` is nil but the presented certificate carries an `AnchorHash`, the
+marker is **ignored** — trust derives from the pinned root, and the staple is
+additive.
 
 ---
 
@@ -750,8 +839,8 @@ Two callers, two entry points.
 // shippable bundle. Also where suite and pathlen drift are caught.
 func (r *Regime) Verify(c *x509.Certificate, o VerifyOpts) (*Bundle, error)
 
-// Relying-party side: no Regime, no Store, no keys. This is the function
-// that runs on the far end of the wire.
+// Relying-party side: no Regime, no keys, no state. TrustedRoot.Verify (§11.3)
+// is the primary entry point; VerifyBundle covers peers that ship a full bundle.
 func VerifyBundle(b *Bundle, o VerifyOpts) error
 
 type VerifyPolicy uint8
@@ -767,7 +856,7 @@ const (
 )
 
 type VerifyOpts struct {
-	// Exactly one establishes trust. See §4.4.
+	// Exactly one establishes trust. See §4.5.
 	RootPin     []byte
 	TenantRoots *x509.CertPool
 
@@ -798,11 +887,13 @@ var (
 	ErrSuiteMismatch       = errors.New("regime: artifact does not conform to suite")
 	ErrAnchorKeyMismatch   = errors.New("install: cert public key != anchorKey")
 	ErrAttestationStripped = errors.New("install: tenant CA did not carry our extension")
+	ErrRoTSigInvalid       = errors.New("install: root endorsement signature invalid")
 	ErrAnchorExpired       = errors.New("verify: referenced anchor is expired")
 	ErrAnchorRevoked       = errors.New("verify: referenced anchor is revoked")
 	ErrBackCheckFailed     = errors.New("verify: anchor attests a different root")
 	ErrRootPinMismatch     = errors.New("open: root does not match supplied pin")
 	ErrSealVersion         = errors.New("seal: unknown format version")
+	ErrSealCorrupt         = errors.New("seal: authentication failed")
 )
 ```
 
@@ -810,24 +901,43 @@ var (
 
 ## 15. Deliberately absent
 
-Carried over from the security audit of the existing code, each of these removes
-a class of defect rather than a single bug:
+Each of these removes a class of defect found in the predecessor implementation
+rather than a single bug. They are recorded here because the reasoning is the
+justification for several structural choices above.
 
-- **Any `create bool`.** Replaced by distinct `NewRegime` / `OpenRegime` /
-  builder entry points.
-- **Passphrases below the `SeedGuard`.** The Store never sees one, so the
-  audit's H3 (RFC 1423 legacy PEM key encryption, MD5-KDF + unauthenticated CBC)
-  and H4 (passphrase interpolated into an error string) cannot recur.
-- **CN-keyed lookup.** M5: re-issuing a CN silently orphaned a live,
-  unrevocable certificate.
-- **A global CRL.** M8: signed by whichever CA was in hand; conforming verifiers
-  must ignore non-issuer CRLs.
-- **`SignCert(*x509.Certificate)`.** M3: an unauthenticated signing oracle with
-  no proof-of-possession, no validity clamping, and caller-controlled extensions
-  passed through to signature.
-- **JSON import/export.** H1 (exported the DB master key and all private keys in
-  plaintext), H2 (wrong password silently corrupted the DB via a shadowed
-  error), M1, M2, M7, M9 all lived here.
+- **Any `create bool`.** The old `New(cfg, dbname, create)` shadowed the
+  wrong-password error when a JSON payload was present, then proceeded to
+  overwrite a live root CA with records encrypted under a nil key — and returned
+  success. Replaced by distinct `NewRegime` / `OpenRegime` / builder entry points.
+- **Passphrases below the sealing layer.** The old code encrypted per-certificate
+  private keys with RFC 1423 legacy PEM encryption (`x509.EncryptPEMBlock`),
+  deprecated in Go as insecure by design: MD5-based single-iteration key
+  derivation and unauthenticated CBC. It also interpolated the passphrase
+  verbatim into an error string. Neither can recur when nothing below the seal
+  sees a passphrase.
+- **Plaintext export.** The old `ExportJSON` emitted the database master key, the
+  KDF salt, and every private key in the clear; anyone holding an export owned
+  the entire PKI. There is no export path in this design.
+- **CN-keyed lookup.** Certificates were keyed by CommonName, so re-issuing a CN
+  silently overwrote the record while the original certificate remained
+  cryptographically valid — untrackable, unrevocable, invisible to any CRL.
+- **A global CRL.** The old `crl()` signed one list with whichever CA instance
+  the method was called on, so revocations issued by other CAs appeared in a CRL
+  signed by a non-issuer, which conforming verifiers must ignore. It also used
+  the deprecated v1 `Certificate.CreateCRL`, producing CRLs without CRLNumber or
+  AKI extensions.
+- **`SignCert(*x509.Certificate)`.** An unauthenticated signing oracle: it took a
+  caller-supplied certificate template rather than a CSR, so no proof of
+  possession was ever verified, and passed caller-controlled validity, KeyUsage,
+  ExtKeyUsage and extensions through to signature almost verbatim.
+- **Uniform associated data.** Every encrypted record used the same AD, so a
+  record could be relocated between buckets — a client certificate moved into the
+  server bucket decrypted happily. The seal's context string (§8.3) makes each
+  blob decryptable only in its own slot.
+- **JSON import.** Beyond the export problem, the importer wrote the serial under
+  a different key than the reader used, stored revoked entries in a format no
+  reader could parse, dereferenced `pem.Decode` results without nil checks, and
+  verified no signature on anything it ingested.
 
 ---
 
@@ -844,21 +954,22 @@ both fail in ways that superficially resemble success.
 | `MaxPathLenZero` | `MaxPathLen:0` alone silently emits an unconstrained CA |
 | DN rewrite | adding one `OU=` orphans a cross-certified hierarchy |
 | CSR passthrough | a profile-applying CA drops extensions and rewrites the subject |
+| CSR structure | PKCS#10 carries no serial number; `anchorSPKI` is the bindable field |
 | staple | back-check rejects forgery; stripped extension rejected at step 5 |
 | stock verifier | forged leaf is indistinguishable without step 6 |
-| seal | context binding rejects record relocation; version byte authenticated |
+| seal | context binding rejects relocation; version byte authenticated |
 
 ---
 
 ## 17. Open items
 
-1. **IANA PEN** must be registered before the OID is baked into any stored
-   artifact.
-2. **Migration** from the existing boltdb format is unspecified. Given the audit
-   findings in the export path, a documented export-then-reissue is likely safer
-   than an importer.
+1. **IANA PEN** must be registered before the OID is baked into any issued
+   certificate.
+2. **Migration** from the existing boltdb format is unspecified. Given the
+   findings in §15, a documented export-then-reissue is safer than an importer.
 3. **`RootPin` representation** — SPKI hash versus full-certificate hash. SPKI
    survives root-certificate renewal; the 10-year root span makes this largely
    theoretical but it should be decided, not defaulted.
-4. **Concurrency model** — single-writer versus multi-writer via `Store.CAS`
-   needs to be stated normatively rather than left to the backend.
+4. **CRL state growth.** Revoked serials accumulate in the blob for the life of
+   the regime. Pruning entries whose certificates have expired is safe and
+   probably necessary; the policy should be explicit.
